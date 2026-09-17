@@ -34,10 +34,11 @@ function useAssetDataUrl(relativePath) {
 const uid = () => Math.random().toString(36).slice(2, 10);
 
 const MODULE_PRESETS = [
-  { type: "character", name: "人物关系", glyph: "人", tint: "#8a6b3f" },
   { type: "map", name: "地图", glyph: "图", tint: "#3f6b5a" },
+  { type: "character", name: "人物", glyph: "人", tint: "#8a6b3f" },
   { type: "outline", name: "大纲", glyph: "纲", tint: "#5a5c8a" },
   { type: "timeline", name: "时间线", glyph: "线", tint: "#8a4f4f" },
+  { type: "manuscript", name: "正文", glyph: "文", tint: "#4f6b8a" },
 ];
 
 const ICON_LIBRARY = [
@@ -336,6 +337,12 @@ export default function App() {
           onRenameModule={(mid, name) => {
             setCurrentBook((b) => ({ ...b, modules: b.modules.map((m) => (m.id === mid ? { ...m, name } : m)) }));
           }}
+          onDeleteModule={(mid, moduleName) => {
+            const msg = `删除模块「${moduleName}」？该模块下的所有页面都会被一并删除，且不会进入回收站。`;
+            if (!confirm(msg)) return;
+            setCurrentBook((b) => ({ ...b, modules: b.modules.filter((m) => m.id !== mid) }));
+            if (currentModuleId === mid) { setCurrentModuleId(null); setCurrentPageId(null); }
+          }}
           onAddPage={(mid, pageType, name) => {
             const p = newPage(name, pageType);
             setCurrentBook((b) => ({
@@ -578,7 +585,7 @@ function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDele
 
 function Sidebar({
   book, currentModuleId, currentPageId, onBack, onRenameBook,
-  onSelectPage, onAddModule, onRenameModule, onAddPage, onAddSubPage, onRenamePage, onDeletePage,
+  onSelectPage, onAddModule, onRenameModule, onDeleteModule, onAddPage, onAddSubPage, onRenamePage, onDeletePage,
 }) {
   const [openModules, setOpenModules] = useState(() => new Set(book.modules.map((m) => m.id)));
   const [collapsedPages, setCollapsedPages] = useState(() => new Set());
@@ -621,6 +628,11 @@ function Sidebar({
             <div className="module-title" onClick={() => toggle(m.id)}>
               <div className="module-badge" style={{ background: m.tint }}>{glyph}</div>
               <input value={m.name} onClick={(e) => e.stopPropagation()} onChange={(e) => onRenameModule(m.id, e.target.value)} />
+              <button
+                className="icon-action danger"
+                title="删除模块"
+                onClick={(e) => { e.stopPropagation(); onDeleteModule(m.id, m.name); }}
+              >✕</button>
               <span style={{ color: "var(--ink-soft)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
             </div>
             {open && (
@@ -942,7 +954,7 @@ function DrawPage({ page, onChange, bookId, onError }) {
     if (tool === "select" || isPanMode) return;
     const { x, y } = svgPoint(e);
     if (tool === "text") {
-      const el = { id: uid(), type: "text", x, y, text: "文本", note: "", color: "#33302a", bold: false };
+      const el = { id: uid(), type: "text", x, y, text: "文本", note: "", color: "#33302a", bold: false, fontSize: 13 };
       setElements((els) => [...els, el]);
       setTool("select"); setSelectedId(el.id);
       return;
@@ -1314,12 +1326,13 @@ function renderElement(el, isSelected, startDrag, dashArray) {
     // 这里特意不用 contentEditable：一个由 React 渲染内容、又允许浏览器直接编辑 DOM 的元素，
     // 两边对"内容应该是什么"会打架，容易在某些操作顺序下触发渲染异常（之前遇到的白屏问题就出在这里）。
     // 文字内容改在右侧"元素设置"面板里编辑，这里只负责显示和拖动。
+    const fontSize = el.fontSize || 13;
     return (
-      <foreignObject key={el.id} x={el.x} y={el.y - 10} width={260} height={40}>
+      <foreignObject key={el.id} x={el.x} y={el.y - 10} width={Math.max(260, fontSize * 14)} height={Math.max(40, fontSize * 2.4)}>
         <div xmlns="http://www.w3.org/1999/xhtml"
           onMouseDown={(e) => { e.stopPropagation(); startDrag(e, el); }}
           style={{
-            fontSize: 13, fontFamily: "Inter, sans-serif",
+            fontSize, fontFamily: "Inter, sans-serif",
             color: el.color || "#33302a", fontWeight: el.bold ? 700 : 400,
             outline: isSelected ? "1px dashed #8a5a2b" : "none",
             padding: "2px 4px", display: "inline-block", cursor: "move", background: "transparent",
@@ -1369,6 +1382,10 @@ function ElementInspector({ el, onPatch, onDelete }) {
       )}
       {el.type === "text" && (
         <>
+          <div className="field">
+            <label>字号：{el.fontSize || 13}px</label>
+            <input type="range" min="10" max="48" step="1" value={el.fontSize || 13} onChange={(e) => onPatch({ fontSize: Number(e.target.value) })} />
+          </div>
           <div className="field">
             <label>文字颜色</label>
             <input type="color" value={el.color || "#33302a"} onChange={(e) => onPatch({ color: e.target.value })} />

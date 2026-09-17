@@ -137,4 +137,4 @@ novel-settings-tauri/
 
 ## 许可证
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) —— 使用前把 `LICENSE` 文件里的版权人姓名替换成你自己的。
