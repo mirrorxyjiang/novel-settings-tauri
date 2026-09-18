@@ -1,11 +1,11 @@
 [package]
-name = "novel-settings"
+name = "story-box"
 version = "0.1.0"
-description = "小说设定管理工具 —— 本地文件存储的桌面应用"
+description = "Story-Box —— 本地文件存储的小说设定管理桌面应用"
 edition = "2021"
 
 [lib]
-name = "novel_settings_lib"
+name = "story_box_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

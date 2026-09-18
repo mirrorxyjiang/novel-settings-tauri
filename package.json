@@ -1,8 +1,8 @@
 {
-  "name": "novel-settings",
+  "name": "story-box",
   "private": true,
   "version": "0.1.0",
-  "description": "小说设定管理工具 —— 以书籍为单位管理人物关系、地图、大纲、时间线等创作设定的桌面应用（Tauri + React，本地文件存储）。",
+  "description": "Story-Box —— 以书籍为单位管理人物、地点、势力、地图、大纲、时间线与正文等创作设定的桌面应用（Tauri + React，本地文件存储）。",
   "license": "MIT",
   "type": "module",
   "scripts": {

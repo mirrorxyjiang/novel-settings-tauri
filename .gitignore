@@ -21,3 +21,6 @@ npm-debug.log*
 # 环境变量（如果以后加了任何本地密钥/配置，不要提交）
 .env
 .env.local
+
+# 本地助手/工作区数据（不入库）
+.workbuddy/

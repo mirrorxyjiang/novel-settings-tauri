@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   getDataDir, chooseDataDir, listBooks, loadBook, saveBook, deleteBook as deleteBookFile,
-  saveAsset, readAsset, deleteAsset,
+  saveAsset, readAsset, deleteAsset, exportTextPages,
 } from "./store.js";
 
 /**
@@ -26,18 +26,18 @@ function useAssetDataUrl(relativePath) {
 }
 
 /* ============================================================
-   小说设定管理工具 —— Tauri 桌面版（本地文件存储）
-   书籍 -> 模块（人物关系/地图/大纲/时间线/自定义） -> 页面（绘图区/文字区）
+   Story-Box（故事魔盒）—— 小说设定管理工具 · Tauri 桌面版（本地文件存储）
+   书籍 -> 模块（地图/人物/大纲/正文/自定义） -> 页面（绘图区/文字区/时间线/变量）
    每本书独立保存为 数据目录/books/{id}.json，方便备份与云盘同步迁移
    ============================================================ */
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
+// 初始模块预设：时间线不再作为独立模块（所有非正文模块都能添加时间线页面）
 const MODULE_PRESETS = [
   { type: "map", name: "地图", glyph: "图", tint: "#3f6b5a" },
   { type: "character", name: "人物", glyph: "人", tint: "#8a6b3f" },
   { type: "outline", name: "大纲", glyph: "纲", tint: "#5a5c8a" },
-  { type: "timeline", name: "时间线", glyph: "线", tint: "#8a4f4f" },
   { type: "manuscript", name: "正文", glyph: "文", tint: "#4f6b8a" },
 ];
 
@@ -60,6 +60,66 @@ const ICON_LIBRARY = [
   { key: "heart", glyph: "♥", label: "情感" },
 ];
 
+const PAGE_TYPE_DOT = { draw: "#8a5a2b", text: "#5a6b8a", timeline: "#5a8a6f", charvars: "#a3853f" };
+
+/* ------------------------------------------------------------
+   变量页（正文模块专用）的类目定义与数据规整。
+   旧版数据只有 characters（角色名单），这里统一迁移成 4 类结构。
+   ------------------------------------------------------------ */
+const VAR_CATEGORIES = [
+  { key: "char", label: "角色", maxLen: 4 },
+  { key: "place", label: "地点", maxLen: 8 },
+  { key: "force", label: "势力", maxLen: 8 },
+  { key: "item", label: "物品", maxLen: 8 },
+];
+const MAX_VARS_PER_CATEGORY = 12;
+
+// 把变量页内容规整成统一的 { categories: [{key,label,maxLen,items}] }
+function normalizeVarContent(content) {
+  const cats = content && Array.isArray(content.categories) ? content.categories : [];
+  return {
+    categories: VAR_CATEGORIES.map((def) => {
+      const found = cats.find((c) => c && c.key === def.key);
+      return {
+        key: def.key,
+        label: def.label,
+        maxLen: def.maxLen,
+        items: found && Array.isArray(found.items) ? found.items : [],
+      };
+    }),
+  };
+}
+
+// 把富文本 HTML 转成纯文本（块级元素转成换行），用于导出 txt
+function htmlToPlainText(html) {
+  const container = document.createElement("div");
+  container.innerHTML = html || "";
+  const BLOCK_TAGS = new Set(["DIV", "P", "LI", "H1", "H2", "H3", "H4", "UL", "OL", "TR", "BR"]);
+  let out = "";
+  const walk = (node) => {
+    node.childNodes.forEach((child) => {
+      if (child.nodeType === 3) { out += child.textContent; return; }
+      if (child.nodeType !== 1) return;
+      const tag = child.tagName;
+      if (tag === "BR") { out += "\n"; return; }
+      if (tag === "LI") out += "• ";
+      walk(child);
+      if (BLOCK_TAGS.has(tag)) out += "\n";
+    });
+  };
+  walk(container);
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// 递归收集一棵页面树里所有文字页（不包含变量页），返回 [{ name, html }]
+function collectTextPages(pages, out = []) {
+  for (const p of pages) {
+    if (p.pageType === "text") out.push({ name: p.name || "未命名", html: (p.content && p.content.html) || "" });
+    if (p.children && p.children.length) collectTextPages(p.children, out);
+  }
+  return out;
+}
+
 function newBook(name) {
   const now = Date.now();
   return {
@@ -72,18 +132,51 @@ function newBook(name) {
       name: m.name,
       type: m.type,
       tint: m.tint,
-      pages: [],
+      // "正文"模块固定带一个"变量"页，用来集中定义各类变量（角色/地点/势力/物品），供这个模块下所有文字页的变量板读取
+      pages: m.type === "manuscript" ? [newPage("变量", "charvars")] : [],
     })),
   };
 }
 
+const DEFAULT_CELL_COLOR_LEGEND = [
+  { key: "crisis", color: "#d9534f", label: "危机" },
+  { key: "friend", color: "#4caf7d", label: "交友" },
+  { key: "romance", color: "#e07ab0", label: "情缘" },
+];
+const DEFAULT_ICON_COLOR_LEGEND = [
+  { key: "firstMeet", color: "#3f6b5a", label: "首次遇见" },
+  { key: "firstArrive", color: "#8a5a2b", label: "首次到达" },
+  { key: "again", color: "#5a5c8a", label: "二次出现" },
+];
+
 function newPage(name, pageType) {
+  let content;
+  let defaultName;
+  if (pageType === "draw") {
+    content = { elements: [] };
+    defaultName = "新绘图页";
+  } else if (pageType === "timeline") {
+    content = {
+      axis: { years: [] },
+      characters: [],
+      cells: {},
+      cellColorLegend: DEFAULT_CELL_COLOR_LEGEND.map((c) => ({ ...c })),
+      iconLegend: DEFAULT_ICON_COLOR_LEGEND.map((c) => ({ ...c })),
+    };
+    defaultName = "新时间线";
+  } else if (pageType === "charvars") {
+    content = normalizeVarContent({});
+    defaultName = "变量";
+  } else {
+    content = { html: "" };
+    defaultName = "新文字页";
+  }
   return {
     id: uid(),
-    name: name || (pageType === "draw" ? "新绘图页" : "新文字页"),
-    pageType, // 'draw' | 'text'
-    content: pageType === "draw" ? { elements: [] } : { html: "" },
-    children: [], // 子页面（同样是 draw/text 页面的数组），支持任意层级嵌套
+    name: name || defaultName,
+    pageType, // 'draw' | 'text' | 'timeline' | 'charvars'
+    content,
+    children: [], // 子页面（同样是 draw/text/... 页面的数组），支持任意层级嵌套
   };
 }
 
@@ -131,6 +224,127 @@ function removePageInTree(pages, id) {
     .map((p) => (p.children && p.children.length ? { ...p, children: removePageInTree(p.children, id) } : p));
 }
 
+/* ------------------------------------------------------------
+   时间线"年→月→日→时辰"轴的一组纯函数工具。
+   每一级节点的子级字段名是固定的（年用 months，月用 days，日用 hours，时辰没有下一级），
+   所以可以直接根据节点自己身上有哪个字段来判断它是哪一级、该往哪个字段递归，
+   不需要额外传"当前层级"这种参数，代码简单很多。
+   ------------------------------------------------------------ */
+
+const AXIS_CHILD_KEY = { year: "months", month: "days", day: "hours" };
+const AXIS_NEXT_LEVEL = { year: "month", month: "day", day: "hour" };
+
+function axisChildrenKeyOf(node) {
+  if ("months" in node) return "months";
+  if ("days" in node) return "days";
+  if ("hours" in node) return "hours";
+  return null; // 时辰节点，没有下一级
+}
+
+function newAxisNode(name) {
+  return { id: uid(), name };
+}
+
+// 按 id 递归查找并替换某个轴节点
+function mapAxisTree(nodes, id, fn) {
+  return nodes.map((n) => {
+    if (n.id === id) return fn(n);
+    const key = axisChildrenKeyOf(n);
+    if (key && n[key] && n[key].length) return { ...n, [key]: mapAxisTree(n[key], id, fn) };
+    return n;
+  });
+}
+
+// 在某个节点的子级数组里，于目标节点前/后插入一个新的同级节点；nodes 是"父级数组"本身
+function insertSiblingInTree(nodes, siblingId, newNode, after) {
+  const idx = nodes.findIndex((n) => n.id === siblingId);
+  if (idx !== -1) {
+    const copy = nodes.slice();
+    copy.splice(after ? idx + 1 : idx, 0, newNode);
+    return copy;
+  }
+  return nodes.map((n) => {
+    const key = axisChildrenKeyOf(n);
+    if (key && n[key] && n[key].length) return { ...n, [key]: insertSiblingInTree(n[key], siblingId, newNode, after) };
+    return n;
+  });
+}
+
+// 给某个节点新增第一个子级（年加月/月加日/日加时辰）
+function addChildInTree(nodes, parentId, childKey, newNode) {
+  return nodes.map((n) => {
+    if (n.id === parentId) return { ...n, [childKey]: [...(n[childKey] || []), newNode] };
+    const key = axisChildrenKeyOf(n);
+    if (key && n[key] && n[key].length) return { ...n, [key]: addChildInTree(n[key], parentId, childKey, newNode) };
+    return n;
+  });
+}
+
+// 递归收集某个节点自身 + 其下所有子节点的 id（用于删除节点时一并清理它名下的格子数据）
+function collectSubtreeIds(node, out) {
+  out.push(node.id);
+  const key = axisChildrenKeyOf(node);
+  if (key && node[key]) node[key].forEach((c) => collectSubtreeIds(c, out));
+}
+
+// 递归删除某个 id 对应的轴节点（连同其所有子节点）；返回 { years, removedIds }
+function removeAxisNode(nodes, id) {
+  let removedIds = [];
+  const filtered = nodes.filter((n) => {
+    if (n.id === id) {
+      collectSubtreeIds(n, removedIds);
+      return false;
+    }
+    return true;
+  });
+  if (removedIds.length) return { years: filtered, removedIds };
+  const next = filtered.map((n) => {
+    const key = axisChildrenKeyOf(n);
+    if (key && n[key] && n[key].length) {
+      const res = removeAxisNode(n[key], id);
+      if (res.removedIds.length) { removedIds = res.removedIds; return { ...n, [key]: res.years }; }
+    }
+    return n;
+  });
+  return { years: next, removedIds };
+}
+
+/**
+ * 把"年→月→日→时辰"的树，按深度优先遍历成四行表头（年/月/日/时辰）+ 叶子列清单。
+ * 某个节点只要还没有下一级子节点，它自己就是"叶子列"（可以直接挂数据），
+ * rowSpan 会一路撑到表头最后一行；一旦有子节点，它就是纯表头，rowSpan=1，
+ * colSpan = 它名下叶子列的总数。这样不同年/月/日深度不一致也能正常渲染。
+ */
+function buildTimelineHeader(years) {
+  const headerRows = [[], [], [], []]; // 年 / 月 / 日 / 时辰
+  const leafColumns = []; // { id, path: {year,month,day,hour} }
+
+  function countLeaves(node) {
+    const key = axisChildrenKeyOf(node);
+    if (!key || !node[key] || node[key].length === 0) return 1;
+    return node[key].reduce((sum, c) => sum + countLeaves(c), 0);
+  }
+
+  function walk(node, rowIndex, path) {
+    const key = axisChildrenKeyOf(node);
+    const hasChildren = key && node[key] && node[key].length > 0;
+    const colSpan = hasChildren ? countLeaves(node) : 1;
+    const rowSpan = hasChildren ? 1 : 4 - rowIndex;
+    headerRows[rowIndex].push({ id: node.id, name: node.name, colSpan, rowSpan, level: LEVEL_NAMES[rowIndex] });
+    const nextPath = { ...path, [LEVEL_NAMES[rowIndex]]: node.name };
+    if (hasChildren) {
+      node[key].forEach((child) => walk(child, rowIndex + 1, nextPath));
+    } else {
+      leafColumns.push({ id: node.id, path: nextPath });
+    }
+  }
+
+  years.forEach((y) => walk(y, 0, {}));
+  return { headerRows, leafColumns };
+}
+const LEVEL_NAMES = ["year", "month", "day", "hour"];
+const LEVEL_LABELS = { year: "年", month: "月", day: "日", hour: "时辰" };
+
 function defaultShapeStyle() {
   return { stroke: "#33302a", strokeWidth: 2, strokeStyle: "solid", fill: "#c9b98a", fillOpacity: 0.25 };
 }
@@ -145,6 +359,7 @@ export default function App() {
   const [currentPageId, setCurrentPageId] = useState(null);
   const [toast, setToast] = useState("");
   const [opening, setOpening] = useState(false);
+  const dlg = useDialog();
 
   const flashToast = (msg) => {
     setToast(msg);
@@ -294,6 +509,23 @@ export default function App() {
     }
   };
 
+  // 正文模块一键导出：模块内所有文字页面（含各层级子页面）各导出一个 txt
+  const exportManuscriptModule = async (mid) => {
+    const mod = currentBook?.modules.find((m) => m.id === mid);
+    if (!mod || mod.type !== "manuscript") return;
+    const pages = collectTextPages(mod.pages);
+    if (pages.length === 0) {
+      flashToast("该模块里还没有文字页面，没有可导出的内容");
+      return;
+    }
+    try {
+      const count = await exportTextPages(pages.map((p) => ({ name: p.name, content: htmlToPlainText(p.html) })));
+      if (count > 0) flashToast(`已导出 ${count} 个文字页面为 txt`);
+    } catch (e) {
+      flashToast("导出失败：" + String(e));
+    }
+  };
+
   if (bookIndex === null || opening) {
     return <Shell><div className="loading">{opening ? "正在打开书籍…" : "正在载入设定库…"}</div></Shell>;
   }
@@ -329,19 +561,36 @@ export default function App() {
           onRenameBook={(name) => setCurrentBook((b) => ({ ...b, name }))}
           onSelectPage={(mid, pid) => { setCurrentModuleId(mid); setCurrentPageId(pid); }}
           onAddModule={() => {
+            // 新建自定义模块：插到第一个"正文"模块之前（与地图/人物/大纲等普通模块排在一起）
+            const mod = { id: uid(), name: "新模块", type: "custom", tint: "#6b6558", pages: [] };
+            setCurrentBook((b) => {
+              const idx = b.modules.findIndex((m) => m.type === "manuscript");
+              const modules = idx === -1
+                ? [...b.modules, mod]
+                : [...b.modules.slice(0, idx), mod, ...b.modules.slice(idx)];
+              return { ...b, modules };
+            });
+          }}
+          onAddManuscriptModule={() => {
+            const preset = MODULE_PRESETS.find((p) => p.type === "manuscript");
             setCurrentBook((b) => ({
               ...b,
-              modules: [...b.modules, { id: uid(), name: "新模块", type: "custom", tint: "#6b6558", pages: [] }],
+              modules: [...b.modules, { id: uid(), name: preset.name, type: "manuscript", tint: preset.tint, pages: [newPage("变量", "charvars")] }],
             }));
           }}
+          onExportModule={(mid) => exportManuscriptModule(mid)}
           onRenameModule={(mid, name) => {
             setCurrentBook((b) => ({ ...b, modules: b.modules.map((m) => (m.id === mid ? { ...m, name } : m)) }));
           }}
-          onDeleteModule={(mid, moduleName) => {
-            const msg = `删除模块「${moduleName}」？该模块下的所有页面都会被一并删除，且不会进入回收站。`;
-            if (!confirm(msg)) return;
-            setCurrentBook((b) => ({ ...b, modules: b.modules.filter((m) => m.id !== mid) }));
-            if (currentModuleId === mid) { setCurrentModuleId(null); setCurrentPageId(null); }
+          onDeleteModule={async (mid, moduleName) => {
+            const ok = await dlg.confirm(
+              `删除模块「${moduleName}」？该模块下的所有页面都会被一并删除，且不会进入回收站。`,
+              "删除模块"
+            );
+            if (ok) {
+              setCurrentBook((b) => ({ ...b, modules: b.modules.filter((m) => m.id !== mid) }));
+              if (currentModuleId === mid) { setCurrentModuleId(null); setCurrentPageId(null); }
+            }
           }}
           onAddPage={(mid, pageType, name) => {
             const p = newPage(name, pageType);
@@ -368,6 +617,12 @@ export default function App() {
             }));
           }}
           onDeletePage={(mid, pid) => {
+            const mod = currentBook.modules.find((m) => m.id === mid);
+            const page = mod ? findPageInTree(mod.pages, pid) : null;
+            if (page && page.pageType === "charvars") {
+              flashToast("「变量」页面是正文模块的固定页面，不能删除");
+              return;
+            }
             setCurrentBook((b) => ({
               ...b,
               modules: b.modules.map((m) => (m.id !== mid ? m : { ...m, pages: removePageInTree(m.pages, pid) })),
@@ -380,13 +635,96 @@ export default function App() {
             <EmptyState moduleName={currentModule?.name} />
           ) : currentPage.pageType === "draw" ? (
             <DrawPage page={currentPage} onChange={updateCurrentPage} bookId={currentBook.id} onError={flashToast} />
+          ) : currentPage.pageType === "timeline" ? (
+            <TimelinePage page={currentPage} onChange={updateCurrentPage} />
+          ) : currentPage.pageType === "charvars" ? (
+            <CharacterVarsPage page={currentPage} onChange={updateCurrentPage} />
           ) : (
-            <TextPage page={currentPage} onChange={updateCurrentPage} />
+            <TextPage
+              page={currentPage}
+              onChange={updateCurrentPage}
+              variables={
+                currentModule?.type === "manuscript"
+                  ? normalizeVarContent(currentModule.pages.find((p) => p.pageType === "charvars")?.content).categories
+                  : null
+              }
+            />
           )}
         </main>
       </div>
       {toast && <div className="toast">{toast}</div>}
     </Shell>
+  );
+}
+
+/* ============================================================ 应用内弹窗：confirm / alert / prompt
+   Tauri v2 的 WebView（wry）没有实现 JS 原生对话框，window.confirm / prompt / alert 在打包后的
+   桌面端里常常静默失效（不弹窗、直接返回默认值），所以这里用一套自绘的模态框统一替代。
+   用法：const dlg = useDialog(); await dlg.confirm("确定删除？") / await dlg.prompt("名称：", "默认")
+   confirm 返回 true/false，prompt 返回字符串（取消/空输入返回 null）。
+   ============================================================ */
+
+const DialogContext = React.createContext(null);
+const useDialog = () => React.useContext(DialogContext);
+
+export function DialogProvider({ children }) {
+  const [dlg, setDlg] = useState(null); // { kind, title, message, defaultValue, resolve }
+  const [value, setValue] = useState("");
+  const inputRef = useRef(null);
+
+  const close = (result) => {
+    if (!dlg) return;
+    dlg.resolve(result);
+    setDlg(null);
+  };
+
+  const api = useMemo(() => ({
+    confirm: (message, title = "确认操作") => new Promise((resolve) => setDlg({ kind: "confirm", title, message, resolve })),
+    alert: (message, title = "提示") => new Promise((resolve) => setDlg({ kind: "alert", title, message, resolve })),
+    prompt: (message, defaultValue = "", title = "输入") =>
+      new Promise((resolve) => { setValue(defaultValue); setDlg({ kind: "prompt", title, message, resolve }); }),
+  }), []);
+
+  // prompt 弹出时自动聚焦并全选已有内容
+  useEffect(() => {
+    if (!dlg) return;
+    if (inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
+  }, [dlg]);
+  useEffect(() => {
+    if (!dlg) return;
+    const onKey = (e) => { if (e.key === "Escape") close(dlg.kind === "prompt" ? null : false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dlg]);
+
+  return (
+    <DialogContext.Provider value={api}>
+      {children}
+      {dlg && (
+        <div className="modal-mask" onMouseDown={() => close(dlg.kind === "prompt" ? null : false)}>
+          <div className="modal-box" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modal-title">{dlg.title}</div>
+            <div className="modal-msg">{dlg.message}</div>
+            {dlg.kind === "prompt" && (
+              <input
+                ref={inputRef} className="modal-input" value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); close(value.trim() || null); } }}
+              />
+            )}
+            <div className="modal-actions">
+              {dlg.kind !== "alert" && (
+                <button className="modal-btn" onClick={() => close(dlg.kind === "prompt" ? null : false)}>取消</button>
+              )}
+              <button
+                className="modal-btn primary"
+                onClick={() => close(dlg.kind === "prompt" ? (value.trim() || null) : true)}
+              >确定</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </DialogContext.Provider>
   );
 }
 
@@ -448,12 +786,124 @@ function Shell({ children }) {
         .add-module-btn { margin: 10px 16px; padding: 8px; border: 1px dashed var(--line); background: none;
           border-radius: 6px; cursor: pointer; font-size: 12.5px; color: var(--ink-soft); }
         .add-module-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .charvars-body { padding: 24px 32px; max-width: none; overflow-y: auto; flex: 1; min-height: 0; }
+        .charvars-hint { font-size: 12px; color: var(--ink-soft); line-height: 1.7; margin-bottom: 18px; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; max-width: 1080px; }
+        .charvars-empty { font-size: 12px; color: var(--ink-soft); padding: 8px 0; }
+        /* 变量页：四个类别横向排布 */
+        .vars-body { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+        .vars-cat { flex: 1; min-width: 216px; max-width: 320px; background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; padding: 12px 14px; }
+        .vars-cat-title { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+        .vars-cat-title span:first-child { font-family: 'Noto Serif SC', serif; font-weight: 700; font-size: 14px; }
+        .vars-cat-count { font-size: 10.5px; color: var(--ink-soft); }
+        .vars-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+        .vars-order { display: flex; flex-direction: column; gap: 1px; }
+        .vars-order button { width: 16px; height: 13px; font-size: 7px; border: 1px solid var(--line); background: var(--panel);
+          cursor: pointer; color: var(--ink-soft); padding: 0; line-height: 1; }
+        .vars-order button:disabled { opacity: 0.3; cursor: default; }
+        .vars-order button:first-child { border-radius: 3px 3px 0 0; }
+        .vars-order button:last-child { border-radius: 0 0 3px 3px; }
+        .vars-index { font-size: 11px; color: var(--ink-soft); width: 20px; text-align: right; flex-shrink: 0;
+          font-variant-numeric: tabular-nums; }
+        .vars-row input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; font-size: 13px;
+          font-family: inherit; background: #fff; color: var(--ink); }
+        .vars-cat-add { width: 100%; margin-top: 4px; padding: 6px; border: 1px dashed var(--line); background: none;
+          border-radius: 5px; cursor: pointer; font-size: 12px; color: var(--ink-soft); }
+        .vars-cat-add:hover { border-color: var(--accent); color: var(--accent); }
+        .vars-cat-full { width: 100%; margin-top: 4px; padding: 6px; text-align: center; font-size: 11px; color: var(--ink-soft);
+          border: 1px dashed var(--line); border-radius: 5px; opacity: 0.7; }
+
+        /* ---------- 时间线 ---------- */
+        .timeline-page { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+        .legend-bar { display: flex; flex-wrap: wrap; gap: 14px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); font-size: 11.5px; }
+        .legend-group { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .legend-group-label { color: var(--ink-soft); font-weight: 600; margin-right: 2px; }
+        .legend-chip { display: flex; align-items: center; gap: 4px; border: 1px solid var(--line); background: var(--paper);
+          border-radius: 12px; padding: 2px 8px 2px 4px; }
+        .legend-chip input[type=color] { width: 16px; height: 16px; border: none; padding: 0; border-radius: 50%; overflow: hidden; cursor: pointer; }
+        .legend-chip span { cursor: pointer; color: var(--ink); }
+        .legend-chip span:hover { color: var(--accent); }
+        .legend-chip .legend-del { border: none; background: none; cursor: pointer; color: var(--ink-soft); font-size: 10px; padding: 0 0 0 2px; }
+        .legend-chip .legend-del:hover { color: var(--danger); }
+        .legend-add-btn { border: 1px dashed var(--line); background: none; border-radius: 12px; padding: 2px 10px; cursor: pointer; color: var(--ink-soft); }
+        .legend-add-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+        .timeline-toolbar { display: flex; gap: 8px; padding: 6px 16px; border-bottom: 1px solid var(--line); background: var(--paper); }
+        .timeline-toolbar button { font-size: 11.5px; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+          padding: 4px 10px; border-radius: 5px; cursor: pointer; }
+        .timeline-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+
+        .timeline-body { flex: 1; display: flex; min-height: 0; }
+        .timeline-scroll { flex: 1; overflow: auto; background: var(--paper); }
+        .timeline-table { border-collapse: separate; border-spacing: 0; font-size: 11.5px; }
+        .timeline-table th, .timeline-table td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+        .tl-corner { position: sticky; top: 0; left: 0; z-index: 5; background: var(--panel); }
+        .tl-head-cell { position: sticky; background: var(--panel); padding: 3px 4px; min-width: 56px; vertical-align: top; z-index: 3; }
+        .tl-head-row-0 .tl-head-cell { top: 0; }
+        .tl-head-row-1 .tl-head-cell { top: 30px; }
+        .tl-head-row-2 .tl-head-cell { top: 60px; }
+        .tl-head-row-3 .tl-head-cell { top: 90px; }
+        .tl-head-name { font-weight: 600; color: var(--ink); cursor: pointer; text-align: center; padding: 2px 0; }
+        .tl-head-name:hover { color: var(--accent); }
+        .tl-head-actions { display: flex; justify-content: center; gap: 2px; opacity: 0; }
+        .tl-head-cell:hover .tl-head-actions { opacity: 1; }
+        .tl-head-actions button { border: none; background: rgba(0,0,0,0.06); border-radius: 3px; width: 15px; height: 15px;
+          font-size: 9px; cursor: pointer; color: var(--ink-soft); padding: 0; line-height: 1; }
+        .tl-head-actions button:hover { background: var(--accent); color: #fff; }
+        .tl-add-child { display: block; margin: 2px auto 0; border: 1px dashed var(--line); background: none; border-radius: 3px;
+          font-size: 9px; color: var(--ink-soft); cursor: pointer; opacity: 0; padding: 0 4px; }
+        .tl-head-cell:hover .tl-add-child { opacity: 1; }
+        .tl-add-child:hover { border-color: var(--accent); color: var(--accent); }
+
+        .tl-char-cell, .tl-row-cell { position: sticky; background: var(--panel); padding: 5px 8px; z-index: 2; }
+        /* 两个行首列都用固定宽度，保证吸顶表头的左上角（colSpan=2）与下方两列严格对齐，
+           否则列宽随内容伸缩时，吸左的行名列会遮住第一个数据列 */
+        .tl-char-cell { left: 0; width: 92px; min-width: 92px; max-width: 92px; font-weight: 600; color: var(--ink); z-index: 4; }
+        .tl-row-cell { left: 92px; width: 92px; min-width: 92px; max-width: 92px; color: var(--ink-soft); z-index: 2; }
+        .tl-char-name { cursor: pointer; }
+        .tl-char-name:hover { color: var(--accent); }
+        .tl-row-name { cursor: pointer; }
+        .tl-row-name:hover { color: var(--accent); }
+        .tl-char-actions, .tl-row-actions { display: flex; gap: 2px; margin-top: 3px; opacity: 0; }
+        .tl-char-cell:hover .tl-char-actions, .tl-row-cell:hover .tl-row-actions { opacity: 1; }
+        .tl-char-actions button, .tl-row-actions button { border: none; background: rgba(0,0,0,0.06); border-radius: 3px;
+          font-size: 9px; cursor: pointer; color: var(--ink-soft); padding: 1px 4px; }
+        .tl-char-actions button:hover, .tl-row-actions button:hover { background: var(--accent); color: #fff; }
+        .tl-char-group-start .tl-char-cell, .tl-char-group-start .tl-row-cell, .tl-char-group-start .tl-data-cell {
+          border-top: 3px solid var(--ink); }
+
+        .tl-data-cell { min-width: 68px; max-width: 96px; height: 40px; padding: 3px 4px; cursor: pointer; vertical-align: top; }
+        .tl-data-cell:hover { outline: 1px solid var(--accent-soft); outline-offset: -1px; }
+        .tl-data-cell.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+        .tl-data-text { font-size: 11px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tl-data-icons { display: flex; gap: 2px; margin-top: 2px; align-items: center; }
+        .tl-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; border: 1px solid rgba(0,0,0,0.15); }
+        .tl-dot-more { font-size: 9px; color: var(--ink-soft); }
+
+        .tl-cell-panel { width: 260px; flex-shrink: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 16px; overflow-y: auto; font-size: 12.5px; }
+        .tl-cell-panel h4 { font-family: 'Noto Serif SC', serif; font-size: 13.5px; margin: 0 0 12px; }
+        .tl-color-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+        .tl-color-swatch { width: 22px; height: 22px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+        .tl-color-swatch.on { border-color: var(--ink); }
+        .tl-color-none { width: 22px; height: 22px; border-radius: 50%; border: 1px dashed var(--line); background: #fff;
+          cursor: pointer; font-size: 10px; color: var(--ink-soft); }
+        .tl-icon-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+        .tl-icon-row { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; background: #fff; }
+        .tl-icon-row .tl-dot { width: 13px; height: 13px; }
+        .tl-icon-row .lbl { font-size: 11px; color: var(--ink); font-weight: 600; }
+        .tl-icon-row .note { font-size: 10.5px; color: var(--ink-soft); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tl-icon-row button { border: none; background: none; color: var(--danger); cursor: pointer; font-size: 10px; }
+        .tl-icon-add-row { display: flex; flex-wrap: wrap; gap: 5px; }
+        .tl-icon-add-row button.tl-color-swatch { width: 20px; height: 20px; }
         .main-area { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--paper); }
         .empty-state { margin: auto; text-align: center; color: var(--ink-soft); font-size: 13.5px; }
         .empty-state .big { font-family: 'Noto Serif SC', serif; font-size: 20px; color: var(--ink); margin-bottom: 6px; }
         .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink);
           color: var(--paper); padding: 8px 16px; border-radius: 6px; font-size: 12.5px; max-width: 70%; text-align: center; }
         .library { margin: auto; width: 100%; max-width: 880px; padding: 48px 32px; overflow-y: auto; max-height: 100%; }
+        .library-brand { font-family: 'Inter', sans-serif; font-size: 12px; letter-spacing: 1px; text-transform: none;
+          color: var(--accent); font-weight: 600; margin-bottom: 10px; }
         .library h1 { font-family: 'Noto Serif SC', serif; font-size: 30px; margin: 0 0 6px; }
         .library .sub { color: var(--ink-soft); font-size: 13.5px; margin-bottom: 10px; }
         .storage-row { display: flex; align-items: center; gap: 10px; margin-bottom: 28px; font-size: 12px;
@@ -475,7 +925,19 @@ function Shell({ children }) {
           justify-content: center; cursor: pointer; min-height: 96px; color: var(--ink-soft); font-size: 13px; flex-direction: column; gap: 6px; }
         .new-book-card:hover { border-color: var(--accent); color: var(--accent); }
         .new-book-card .plus { font-size: 22px; }
-        .text-page { display: flex; flex-direction: column; height: 100%; }
+        .text-page { display: flex; flex-direction: row; height: 100%; min-height: 0; }
+        .text-page-main { display: flex; flex-direction: column; flex: 1; min-width: 0; height: 100%; }
+        /* 文字页上边栏的变量板：角色 / 地点 / 势力 / 物品 四类，一组一行，每组最多 12 个 */
+        .vars-bar { display: flex; flex-direction: column; gap: 6px; padding: 8px 20px;
+          border-bottom: 1px solid var(--line); background: var(--paper); max-height: 168px; overflow-y: auto; }
+        .vars-group { display: flex; align-items: flex-start; gap: 10px; }
+        .vars-group-label { font-size: 11.5px; font-weight: 600; color: var(--ink-soft); padding-top: 4px;
+          width: 36px; flex-shrink: 0; }
+        .vars-chips { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
+        .vars-chip { font-size: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+          border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+        .vars-chip:hover { border-color: var(--accent); color: var(--accent); background: #fff; }
+        .vars-empty { font-size: 11px; color: #a89f8c; padding: 3px 0; }
         .page-topbar { display: flex; align-items: center; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
         .page-topbar input.page-name { font-family: 'Noto Serif SC', serif; font-size: 16px; font-weight: 700; border: none; background: transparent; color: var(--ink); flex: 1; }
         .page-topbar .tag { font-size: 11px; color: #fff; background: var(--accent-soft); padding: 2px 8px; border-radius: 10px; }
@@ -521,6 +983,21 @@ function Shell({ children }) {
         .delete-el-btn { width: 100%; padding: 7px 0; border: 1px solid var(--danger); color: var(--danger); background: none; border-radius: 5px; cursor: pointer; font-size: 12px; margin-top: 6px; }
         .delete-el-btn:hover { background: var(--danger); color: #fff; }
         .panel-empty { color: var(--ink-soft); text-align: center; padding: 30px 0; font-size: 12px; }
+        .modal-mask { position: fixed; inset: 0; background: rgba(44,42,36,0.35); z-index: 100;
+          display: flex; align-items: center; justify-content: center; }
+        .modal-box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          box-shadow: 0 12px 32px rgba(0,0,0,0.18); padding: 18px 20px 14px; width: 340px; max-width: 86vw; }
+        .modal-title { font-family: 'Noto Serif SC', serif; font-weight: 700; font-size: 14.5px; margin-bottom: 8px; }
+        .modal-msg { font-size: 13px; line-height: 1.7; color: var(--ink); white-space: pre-wrap; }
+        .modal-input { width: 100%; margin-top: 12px; border: 1px solid var(--line); border-radius: 5px;
+          padding: 7px 9px; font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+        .modal-input:focus { outline: none; border-color: var(--accent); }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        .modal-btn { border: 1px solid var(--line); background: var(--paper); color: var(--ink);
+          border-radius: 5px; padding: 6px 16px; font-size: 12.5px; cursor: pointer; }
+        .modal-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .modal-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+        .modal-btn.primary:hover { background: #755024; color: #fff; }
       `}</style>
       {children}
     </div>
@@ -530,8 +1007,10 @@ function Shell({ children }) {
 /* ============================================================ 书库首页 */
 
 function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDelete, onRename }) {
+  const dlg = useDialog();
   return (
     <div className="library">
+      <div className="library-brand">Story-Box · 故事魔盒</div>
       <h1>设定库</h1>
       <div className="sub">选择一本书继续创作，或新建一本书开始整理设定。</div>
       <div className="storage-row">
@@ -546,18 +1025,22 @@ function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDele
               <button
                 className="icon-action"
                 title="重命名"
-                onClick={(e) => {
+                onClick={async (e) => {
                   e.stopPropagation();
-                  const name = prompt("书籍名称：", b.name);
-                  if (name && name.trim()) onRename(b.id, name.trim());
+                  const name = await dlg.prompt("书籍名称：", b.name, "重命名书籍");
+                  if (name) onRename(b.id, name);
                 }}
               >✎</button>
               <button
                 className="icon-action danger"
                 title="删除"
-                onClick={(e) => {
+                onClick={async (e) => {
                   e.stopPropagation();
-                  if (confirm(`确定删除《${b.name}》吗？文件会被移到回收目录，可从磁盘手动恢复。`)) onDelete(b.id);
+                  const ok = await dlg.confirm(
+                    `确定删除《${b.name}》吗？书籍下的所有模块与页面都会被删除，文件会被移到回收目录，可从磁盘手动恢复。`,
+                    "删除书籍"
+                  );
+                  if (ok) onDelete(b.id);
                 }}
               >✕</button>
             </div>
@@ -568,9 +1051,9 @@ function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDele
         ))}
         <div
           className="new-book-card"
-          onClick={() => {
-            const name = prompt("书籍名称：", "未命名书籍");
-            if (name && name.trim()) onCreate(name.trim());
+          onClick={async () => {
+            const name = await dlg.prompt("书籍名称：", "未命名书籍", "新建书籍");
+            if (name) onCreate(name);
           }}
         >
           <div className="plus">＋</div>
@@ -585,10 +1068,11 @@ function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDele
 
 function Sidebar({
   book, currentModuleId, currentPageId, onBack, onRenameBook,
-  onSelectPage, onAddModule, onRenameModule, onDeleteModule, onAddPage, onAddSubPage, onRenamePage, onDeletePage,
+  onSelectPage, onAddModule, onAddManuscriptModule, onExportModule, onRenameModule, onDeleteModule, onAddPage, onAddSubPage, onRenamePage, onDeletePage,
 }) {
   const [openModules, setOpenModules] = useState(() => new Set(book.modules.map((m) => m.id)));
   const [collapsedPages, setCollapsedPages] = useState(() => new Set());
+  const dlg = useDialog();
   const toggle = (id) => {
     setOpenModules((prev) => {
       const next = new Set(prev);
@@ -603,6 +1087,71 @@ function Sidebar({
       return next;
     });
   };
+  const findPreset = (type) => MODULE_PRESETS.find((p) => p.type === type);
+
+  // 单个模块块的渲染（地图/人物/大纲/自定义/正文 都用这一份）
+  const renderModule = (m) => {
+    const preset = findPreset(m.type);
+    const glyph = preset ? preset.glyph : "自";
+    const open = openModules.has(m.id);
+    return (
+      <div className="module-block" key={m.id}>
+        <div className="module-title" onClick={() => toggle(m.id)}>
+          <div className="module-badge" style={{ background: m.tint }}>{glyph}</div>
+          <input value={m.name} onClick={(e) => e.stopPropagation()} onChange={(e) => onRenameModule(m.id, e.target.value)} />
+          {m.type === "manuscript" && (
+            <button
+              className="icon-action"
+              title="导出本模块所有文字页面为 txt"
+              onClick={(e) => { e.stopPropagation(); onExportModule(m.id); }}
+            >⇩</button>
+          )}
+          <button
+            className="icon-action danger"
+            title="删除模块"
+            onClick={(e) => { e.stopPropagation(); onDeleteModule(m.id, m.name); }}
+          >✕</button>
+          <span style={{ color: "var(--ink-soft)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+        </div>
+        {open && (
+          <>
+            <div className="page-list">
+              {m.pages.map((p) => (
+                <PageNode
+                  key={p.id}
+                  moduleId={m.id}
+                  moduleType={m.type}
+                  page={p}
+                  depth={0}
+                  currentPageId={currentPageId}
+                  collapsedPages={collapsedPages}
+                  onTogglePage={togglePage}
+                  onSelectPage={onSelectPage}
+                  onRenamePage={onRenamePage}
+                  onAddSubPage={onAddSubPage}
+                  onDeletePage={onDeletePage}
+                />
+              ))}
+            </div>
+            <div className="add-page-row">
+              <button onClick={async () => onAddPage(m.id, "text", (await dlg.prompt("文字页名称：", "新文字页", "新建文字页")) || "新文字页")}>+ 文字区</button>
+              {m.type !== "manuscript" && (
+                <>
+                  <button onClick={async () => onAddPage(m.id, "draw", (await dlg.prompt("绘图页名称：", "新绘图页", "新建绘图页")) || "新绘图页")}>+ 绘图区</button>
+                  <button onClick={async () => onAddPage(m.id, "timeline", (await dlg.prompt("时间线名称：", "新时间线", "新建时间线")) || "新时间线")}>+ 时间线</button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
+
+  // 布局：普通模块（含自定义）在上 → 新建自定义模块按钮 → 正文模块 → 新建正文模块按钮
+  const normalModules = book.modules.filter((m) => m.type !== "manuscript");
+  const manuscriptModules = book.modules.filter((m) => m.type === "manuscript");
+
   return (
     <div className="sidebar">
       <div className="sidebar-header">
@@ -612,68 +1161,28 @@ function Sidebar({
           <button
             className="icon-action"
             title="重命名书籍"
-            onClick={() => {
-              const name = prompt("书籍名称：", book.name);
-              if (name && name.trim()) onRenameBook(name.trim());
+            onClick={async () => {
+              const name = await dlg.prompt("书籍名称：", book.name, "重命名书籍");
+              if (name) onRenameBook(name);
             }}
           >✎</button>
         </div>
       </div>
-      {book.modules.map((m) => {
-        const preset = MODULE_PRESETS.find((p) => p.type === m.type);
-        const glyph = preset ? preset.glyph : "自";
-        const open = openModules.has(m.id);
-        return (
-          <div className="module-block" key={m.id}>
-            <div className="module-title" onClick={() => toggle(m.id)}>
-              <div className="module-badge" style={{ background: m.tint }}>{glyph}</div>
-              <input value={m.name} onClick={(e) => e.stopPropagation()} onChange={(e) => onRenameModule(m.id, e.target.value)} />
-              <button
-                className="icon-action danger"
-                title="删除模块"
-                onClick={(e) => { e.stopPropagation(); onDeleteModule(m.id, m.name); }}
-              >✕</button>
-              <span style={{ color: "var(--ink-soft)", fontSize: 11 }}>{open ? "▾" : "▸"}</span>
-            </div>
-            {open && (
-              <>
-                <div className="page-list">
-                  {m.pages.map((p) => (
-                    <PageNode
-                      key={p.id}
-                      moduleId={m.id}
-                      page={p}
-                      depth={0}
-                      currentPageId={currentPageId}
-                      collapsedPages={collapsedPages}
-                      onTogglePage={togglePage}
-                      onSelectPage={onSelectPage}
-                      onRenamePage={onRenamePage}
-                      onAddSubPage={onAddSubPage}
-                      onDeletePage={onDeletePage}
-                    />
-                  ))}
-                </div>
-                <div className="add-page-row">
-                  <button onClick={() => onAddPage(m.id, "text", prompt("文字页名称：", "新文字页") || "新文字页")}>+ 文字区</button>
-                  <button onClick={() => onAddPage(m.id, "draw", prompt("绘图页名称：", "新绘图页") || "新绘图页")}>+ 绘图区</button>
-                </div>
-              </>
-            )}
-          </div>
-        );
-      })}
+      {normalModules.map(renderModule)}
       <button className="add-module-btn" onClick={onAddModule}>+ 新建自定义模块</button>
+      {manuscriptModules.map(renderModule)}
+      <button className="add-module-btn" onClick={onAddManuscriptModule}>+ 新建正文模块</button>
     </div>
   );
 }
 
 // 页面树的单个节点：自己 + 递归渲染子页面。缩进按层级递增，用来体现"页面下的子页面"这种嵌套关系。
-function PageNode({ moduleId, page, depth, currentPageId, collapsedPages, onTogglePage, onSelectPage, onRenamePage, onAddSubPage, onDeletePage }) {
+function PageNode({ moduleId, moduleType, page, depth, currentPageId, collapsedPages, onTogglePage, onSelectPage, onRenamePage, onAddSubPage, onDeletePage }) {
   const hasChildren = page.children && page.children.length > 0;
   const collapsed = collapsedPages.has(page.id);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const rowRef = useRef(null);
+  const dlg = useDialog();
 
   // 点击行外任意地方，自动收起"添加子页面"的类型选择小菜单
   useEffect(() => {
@@ -683,10 +1192,19 @@ function PageNode({ moduleId, page, depth, currentPageId, collapsedPages, onTogg
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [addMenuOpen]);
 
-  const addSub = (type) => {
+  const SUB_PAGE_DEFAULT_NAMES = { draw: "新绘图页", text: "新文字页", timeline: "新时间线" };
+  const addSub = async (type) => {
     setAddMenuOpen(false);
-    const name = prompt("子页面名称：", type === "draw" ? "新绘图页" : "新文字页");
-    if (name && name.trim()) onAddSubPage(moduleId, page.id, type, name.trim());
+    const name = await dlg.prompt("子页面名称：", SUB_PAGE_DEFAULT_NAMES[type] || "新子页面", "新建子页面");
+    if (name) onAddSubPage(moduleId, page.id, type, name);
+  };
+
+  // 子页面类型：正文模块只允许添加文字子页；其他模块还可以加绘图/时间线子页
+  const subPageTypes = moduleType === "manuscript" ? ["text"] : ["text", "draw", "timeline"];
+  const SUB_PAGE_MENU = {
+    text: "📝 文字子页",
+    draw: "🖌 绘图子页",
+    timeline: "🕐 时间线子页",
   };
 
   return (
@@ -700,14 +1218,14 @@ function PageNode({ moduleId, page, depth, currentPageId, collapsedPages, onTogg
           {hasChildren ? (
             <span className="page-caret" onClick={(e) => { e.stopPropagation(); onTogglePage(page.id); }}>{collapsed ? "▸" : "▾"}</span>
           ) : (
-            <span className="type-dot" style={{ background: page.pageType === "draw" ? "#8a5a2b" : "#5a6b8a" }} />
+            <span className="type-dot" style={{ background: PAGE_TYPE_DOT[page.pageType] || "#5a6b8a" }} />
           )}
           <span
             className="p-name"
-            onDoubleClick={(e) => {
+            onDoubleClick={async (e) => {
               e.stopPropagation();
-              const name = prompt("重命名页面：", page.name);
-              if (name && name.trim()) onRenamePage(moduleId, page.id, name.trim());
+              const name = await dlg.prompt("重命名页面：", page.name, "重命名页面");
+              if (name) onRenamePage(moduleId, page.id, name);
             }}
             title="双击重命名"
           >{page.name}</span>
@@ -719,17 +1237,23 @@ function PageNode({ moduleId, page, depth, currentPageId, collapsedPages, onTogg
           <button
             className="page-action-btn danger"
             title="删除"
-            onClick={(e) => {
+            onClick={async (e) => {
               e.stopPropagation();
-              const msg = hasChildren ? `删除页面「${page.name}」？其下的子页面会一并删除。` : `删除页面「${page.name}」？`;
-              if (confirm(msg)) onDeletePage(moduleId, page.id);
+              const ok = await dlg.confirm(
+                hasChildren
+                  ? `删除页面「${page.name}」？其下的子页面会一并删除，无法恢复。`
+                  : `删除页面「${page.name}」？删除后无法恢复。`,
+                "删除页面"
+              );
+              if (ok) onDeletePage(moduleId, page.id);
             }}
           >✕</button>
         </div>
         {addMenuOpen && (
           <div className="add-sub-menu" style={{ marginLeft: 44 + depth * 16 }}>
-            <button onClick={() => addSub("text")}>📝 文字子页</button>
-            <button onClick={() => addSub("draw")}>🖌 绘图子页</button>
+            {subPageTypes.map((t) => (
+              <button key={t} onClick={() => addSub(t)}>{SUB_PAGE_MENU[t]}</button>
+            ))}
           </div>
         )}
       </div>
@@ -737,6 +1261,7 @@ function PageNode({ moduleId, page, depth, currentPageId, collapsedPages, onTogg
         <PageNode
           key={child.id}
           moduleId={moduleId}
+          moduleType={moduleType}
           page={child}
           depth={depth + 1}
           currentPageId={currentPageId}
@@ -763,10 +1288,11 @@ function EmptyState({ moduleName }) {
 
 /* ============================================================ 文字区 */
 
-function TextPage({ page, onChange }) {
+function TextPage({ page, onChange, variables }) {
   const ref = useRef(null);
   const [name, setName] = useState(page.name);
   const typingTimer = useRef(null);
+  const savedRangeRef = useRef(null);
 
   useEffect(() => setName(page.name), [page.id]);
   useEffect(() => {
@@ -781,6 +1307,21 @@ function TextPage({ page, onChange }) {
     }
   }, [page.id]);
   useEffect(() => () => { if (typingTimer.current) clearTimeout(typingTimer.current); }, [page.id]);
+
+  // 持续记录编辑器内最后一次光标/选区的位置，这样点击右侧角色面板插入名字时，
+  // 即使焦点已经切到了面板按钮上，也能准确地插回到刚才光标所在的地方。
+  useEffect(() => {
+    const onSelChange = () => {
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0 && ref.current && ref.current.contains(sel.anchorNode)) {
+          savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+        }
+      } catch (err) { /* 忽略选区读取失败，不影响正常编辑 */ }
+    };
+    document.addEventListener("selectionchange", onSelChange);
+    return () => document.removeEventListener("selectionchange", onSelChange);
+  }, [page.id]);
 
   const exec = (cmd, value) => {
     try {
@@ -815,30 +1356,492 @@ function TextPage({ page, onChange }) {
     onChange((p) => ({ ...p, content: { html: readHtml() } }), { immediate: true });
   };
 
+  // 点击右侧角色面板里的名字，把它插入到正文当前光标处，方便写作时不用手打人名
+  const insertCharacterName = (charName) => {
+    try {
+      const node = ref.current;
+      if (!node) return;
+      node.focus();
+      const sel = window.getSelection();
+      if (!sel) return;
+      if (savedRangeRef.current && node.contains(savedRangeRef.current.startContainer)) {
+        sel.removeAllRanges();
+        sel.addRange(savedRangeRef.current);
+      } else {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      document.execCommand("insertText", false, charName);
+      if (sel.rangeCount > 0) savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+      handleInput();
+    } catch (err) {
+      console.error("插入角色名失败：", err);
+    }
+  };
+
+  // 变量板：正文模块才有（variables 为 null 时隐藏），按类别展示各 12 个变量，点击插入到光标处
+  const hasVars = variables !== null && variables !== undefined;
+
   return (
     <div className="text-page">
+      <div className="text-page-main">
+        <div className="page-topbar">
+          <input className="page-name" value={name} onChange={(e) => { setName(e.target.value); onChange((p) => ({ ...p, name: e.target.value })); }} />
+          <button className="manual-save-btn" onClick={handleManualSave}>💾 立即保存</button>
+          <span className="tag">文字区</span>
+        </div>
+        {hasVars && (
+          <div className="vars-bar">
+            {variables.map((cat) => (
+              <div className="vars-group" key={cat.key}>
+                <span className="vars-group-label">{cat.label}</span>
+                <div className="vars-chips">
+                  {cat.items.length === 0 ? (
+                    <span className="vars-empty">无</span>
+                  ) : (
+                    cat.items.map((it) => (
+                      <button key={it.id} className="vars-chip" title={"插入：" + it.name} onClick={() => insertCharacterName(it.name)}>{it.name}</button>
+                    ))
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="text-toolbar">
+          <button onClick={() => exec("bold")}><b>B</b></button>
+          <button onClick={() => exec("italic")}><i>I</i></button>
+          <button onClick={() => exec("underline")}><u>U</u></button>
+          <button onClick={() => exec("insertUnorderedList")}>•≡</button>
+          <button onClick={() => exec("insertOrderedList")}>1≡</button>
+          <button onMouseDown={(e) => { e.preventDefault(); exec("formatBlock", "H3"); }}>H</button>
+        </div>
+        <div
+          ref={ref} className="text-editor" contentEditable suppressContentEditableWarning
+          data-placeholder="在这里记录设定内容…支持加粗、列表、标题"
+          onInput={handleInput}
+          onBlur={(e) => {
+            if (typingTimer.current) clearTimeout(typingTimer.current);
+            onChange((p) => ({ ...p, content: { html: readHtml(e.currentTarget) } }), { immediate: true });
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ 变量页（正文模块专用） */
+
+function CharacterVarsPage({ page, onChange }) {
+  const [name, setName] = useState(page.name);
+  useEffect(() => setName(page.name), [page.id]);
+  const dlg = useDialog();
+  const { categories } = normalizeVarContent(page.content);
+
+  const setCategories = (fn, opts) =>
+    onChange((p) => ({ ...p, content: { categories: fn(normalizeVarContent(p.content).categories) } }), opts);
+
+  const addVar = async (cat) => {
+    const input = await dlg.prompt(`名称最多 ${cat.maxLen} 个字`, "", `添加${cat.label}`);
+    if (!input) return;
+    if ([...input].length > cat.maxLen) {
+      await dlg.alert(`「${cat.label}」名称最多 ${cat.maxLen} 个字`, "字数超限");
+      return;
+    }
+    setCategories(
+      (cs) => cs.map((c) => (c.key === cat.key && c.items.length < MAX_VARS_PER_CATEGORY
+        ? { ...c, items: [...c.items, { id: uid(), name: input }] }
+        : c)),
+      { immediate: true }
+    );
+  };
+  const renameVar = (catKey, id, newName) =>
+    setCategories((cs) => cs.map((c) => (c.key !== catKey ? c : { ...c, items: c.items.map((it) => (it.id === id ? { ...it, name: newName } : it)) })));
+  const moveVar = (catKey, index, dir) => {
+    setCategories((cs) => cs.map((c) => {
+      if (c.key !== catKey) return c;
+      const next = c.items.slice();
+      const target = index + dir;
+      if (target < 0 || target >= next.length) return c;
+      [next[index], next[target]] = [next[target], next[index]];
+      return { ...c, items: next };
+    }), { immediate: true });
+  };
+  const deleteVar = async (catKey, id, vname) => {
+    const ok = await dlg.confirm(`删除「${vname}」？模块下所有文字页的变量板会同步移除。`, "删除变量");
+    if (!ok) return;
+    setCategories((cs) => cs.map((c) => (c.key !== catKey ? c : { ...c, items: c.items.filter((it) => it.id !== id) })), { immediate: true });
+  };
+
+  return (
+    <div className="text-page">
+      <div className="text-page-main">
+        <div className="page-topbar">
+          <input className="page-name" value={name} onChange={(e) => { setName(e.target.value); onChange((p) => ({ ...p, name: e.target.value })); }} />
+          <span className="tag" style={{ background: "#a3853f" }}>变量</span>
+        </div>
+        <div className="charvars-body">
+          <div className="charvars-hint">
+            在这里定义"正文"模块要用到的变量，分为角色、地点、势力、物品四类；每类最多 {MAX_VARS_PER_CATEGORY} 个，角色名最多 4 个字，其余最多 8 个字。
+            每类条目前面的序号就是它的顺序，模块下所有文字页上边栏的变量板都会按这个顺序展示，点击即可插入正文。
+          </div>
+          <div className="vars-body">
+            {categories.map((cat) => (
+              <div className="vars-cat" key={cat.key}>
+                <div className="vars-cat-title">
+                  <span>{cat.label}</span>
+                  <span className="vars-cat-count">{cat.items.length}/{MAX_VARS_PER_CATEGORY} · ≤{cat.maxLen}字</span>
+                </div>
+                {cat.items.length === 0 ? (
+                  <div className="charvars-empty">还没有{cat.label}，点击下方按钮添加</div>
+                ) : (
+                  cat.items.map((it, i) => (
+                    <div className="vars-row" key={it.id}>
+                      <div className="vars-order">
+                        <button disabled={i === 0} onClick={() => moveVar(cat.key, i, -1)} title="上移">▲</button>
+                        <button disabled={i === cat.items.length - 1} onClick={() => moveVar(cat.key, i, 1)} title="下移">▼</button>
+                      </div>
+                      <span className="vars-index">{i + 1}.</span>
+                      <input value={it.name} maxLength={cat.maxLen} onChange={(e) => renameVar(cat.key, it.id, e.target.value)} />
+                      <button className="icon-action danger" title="删除" onClick={() => deleteVar(cat.key, it.id, it.name)}>✕</button>
+                    </div>
+                  ))
+                )}
+                {cat.items.length >= MAX_VARS_PER_CATEGORY ? (
+                  <div className="vars-cat-full">每类最多 {MAX_VARS_PER_CATEGORY} 个，已满</div>
+                ) : (
+                  <button className="vars-cat-add" onClick={() => addVar(cat)}>+ 添加{cat.label}</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================ 时间线 */
+
+const PALETTE = ["#8a5a2b", "#3f6b5a", "#5a5c8a", "#8a4f4f", "#4f6b8a", "#a3853f", "#6b8a4f", "#8a4f7a"];
+const cellKeyOf = (rowId, colId) => `${rowId}::${colId}`;
+
+function purgeCellsByColIds(cells, removedColIds) {
+  const removed = new Set(removedColIds);
+  const next = {};
+  for (const [key, val] of Object.entries(cells)) { if (!removed.has(key.split("::")[1])) next[key] = val; }
+  return next;
+}
+function purgeCellsByRowIds(cells, removedRowIds) {
+  const removed = new Set(removedRowIds);
+  const next = {};
+  for (const [key, val] of Object.entries(cells)) { if (!removed.has(key.split("::")[0])) next[key] = val; }
+  return next;
+}
+
+function LegendGroup({ label, entries, onRename, onColor, onAdd, onDelete }) {
+  return (
+    <div className="legend-group">
+      <span className="legend-group-label">{label}</span>
+      {entries.map((e) => (
+        <div className="legend-chip" key={e.key}>
+          <input type="color" value={e.color} onChange={(ev) => onColor(e.key, ev.target.value)} />
+          <span onClick={() => onRename(e.key, e.label)} title="点击改名">{e.label}</span>
+          <button className="legend-del" title="删除图例" onClick={() => onDelete(e.key)}>✕</button>
+        </div>
+      ))}
+      <button className="legend-add-btn" onClick={onAdd}>+ 新增</button>
+    </div>
+  );
+}
+
+function CellEditorPanel({ cell, cellColorLegend, iconLegend, onPatch, onClose }) {
+  const dlg = useDialog();
+  const addIcon = async (colorKey) => {
+    const note = (await dlg.prompt("备注说明（可留空）", "", "添加图标批注")) ?? "";
+    onPatch({ icons: [...cell.icons, { id: uid(), colorKey, note }] });
+  };
+  const removeIcon = (id) => onPatch({ icons: cell.icons.filter((i) => i.id !== id) });
+  const editIconNote = async (id, currentNote) => {
+    let note = await dlg.prompt("修改备注", currentNote, "图标批注");
+    if (note === null) return;
+    note = note ?? "";
+    onPatch({ icons: cell.icons.map((i) => (i.id === id ? { ...i, note } : i)) });
+  };
+  return (
+    <div className="tl-cell-panel">
+      <h4>格子设置</h4>
+      <div className="field">
+        <label>内容</label>
+        <textarea value={cell.text} onChange={(e) => onPatch({ text: e.target.value })} placeholder="比如：皇宫 / 萧凛、阿宝 / 初遇" />
+      </div>
+      <div className="field">
+        <label>背景色</label>
+        <div className="tl-color-row">
+          <button className="tl-color-none" title="清除背景色" onClick={() => onPatch({ bg: null })}>无</button>
+          {cellColorLegend.map((l) => (
+            <button key={l.key} className={"tl-color-swatch" + (cell.bg === l.key ? " on" : "")} style={{ background: l.color }} title={l.label} onClick={() => onPatch({ bg: l.key })} />
+          ))}
+        </div>
+      </div>
+      <div className="field">
+        <label>图标批注</label>
+        {cell.icons.length > 0 && (
+          <div className="tl-icon-list">
+            {cell.icons.map((ic) => {
+              const legend = iconLegend.find((l) => l.key === ic.colorKey);
+              return (
+                <div className="tl-icon-row" key={ic.id}>
+                  <span className="tl-dot" style={{ background: legend?.color || "#999" }} />
+                  <span className="lbl">{legend?.label || "?"}</span>
+                  <span className="note" onClick={() => editIconNote(ic.id, ic.note)} title="点击编辑备注">{ic.note || "（点击添加说明）"}</span>
+                  <button onClick={() => removeIcon(ic.id)}>✕</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div className="tl-icon-add-row">
+          {iconLegend.map((l) => (
+            <button key={l.key} className="tl-color-swatch" style={{ background: l.color }} title={"添加：" + l.label} onClick={() => addIcon(l.key)} />
+          ))}
+        </div>
+      </div>
+      <button className="delete-el-btn" onClick={onClose}>关闭</button>
+    </div>
+  );
+}
+
+function TimelinePage({ page, onChange }) {
+  const [name, setName] = useState(page.name);
+  const [selectedCell, setSelectedCell] = useState(null);
+  useEffect(() => setName(page.name), [page.id]);
+  useEffect(() => setSelectedCell(null), [page.id]);
+
+  const content = page.content;
+  const { axis, characters, cells, cellColorLegend, iconLegend } = content;
+  const dlg = useDialog();
+  const setContent = (fn) => onChange((p) => ({ ...p, content: fn(p.content) }));
+
+  const { headerRows, leafColumns } = buildTimelineHeader(axis.years);
+
+  /* ---- 轴（年/月/日/时辰） ---- */
+  const addYearAtEnd = async () => {
+    const nm = await dlg.prompt("名称", "新年份", "新增年份");
+    if (!nm) return;
+    setContent((c) => ({ ...c, axis: { years: [...c.axis.years, newAxisNode(nm)] } }));
+  };
+  const addSiblingAtLevel = async (siblingId, level, after) => {
+    const nm = await dlg.prompt("名称", `新${LEVEL_LABELS[level]}`, `新增${LEVEL_LABELS[level]}`);
+    if (!nm) return;
+    setContent((c) => ({ ...c, axis: { years: insertSiblingInTree(c.axis.years, siblingId, newAxisNode(nm), after) } }));
+  };
+  const addChildAtLevel = async (parentId, level) => {
+    const childKey = AXIS_CHILD_KEY[level];
+    if (!childKey) return;
+    const nextLabel = LEVEL_LABELS[AXIS_NEXT_LEVEL[level]];
+    const nm = await dlg.prompt("名称", `新${nextLabel}`, `新增${nextLabel}`);
+    if (!nm) return;
+    setContent((c) => ({ ...c, axis: { years: addChildInTree(c.axis.years, parentId, childKey, newAxisNode(nm)) } }));
+  };
+  const renameAxisNode = async (id, currentName) => {
+    const nm = await dlg.prompt("名称", currentName, "重命名");
+    if (!nm) return;
+    setContent((c) => ({ ...c, axis: { years: mapAxisTree(c.axis.years, id, (n) => ({ ...n, name: nm })) } }));
+  };
+  const deleteAxisNode = async (id, nodeName) => {
+    const ok = await dlg.confirm(`删除「${nodeName}」？它下面的所有子级、以及已经填的内容都会一起删除。`, "删除轴节点");
+    if (!ok) return;
+    setContent((c) => {
+      const { years, removedIds } = removeAxisNode(c.axis.years, id);
+      return { ...c, axis: { years }, cells: purgeCellsByColIds(c.cells, removedIds) };
+    });
+    if (selectedCell && selectedCell.colId === id) setSelectedCell(null);
+  };
+
+  /* ---- 角色模块与行 ---- */
+  const addCharacter = async () => {
+    const nm = await dlg.prompt("名称", "新角色", "新增角色");
+    if (!nm) return;
+    const ch = { id: uid(), name: nm, rows: [{ id: uid(), name: "地点" }, { id: uid(), name: "人物" }, { id: uid(), name: "事件" }] };
+    setContent((c) => ({ ...c, characters: [...c.characters, ch] }));
+  };
+  const renameCharacterFn = async (id, currentName) => {
+    const nm = await dlg.prompt("名称", currentName, "重命名角色");
+    if (!nm) return;
+    setContent((c) => ({ ...c, characters: c.characters.map((ch) => (ch.id === id ? { ...ch, name: nm } : ch)) }));
+  };
+  const deleteCharacterFn = async (id, cname) => {
+    const ok = await dlg.confirm(`删除角色模块「${cname}」？它下面所有行和已填内容会一起删除。`, "删除角色模块");
+    if (!ok) return;
+    setContent((c) => {
+      const target = c.characters.find((ch) => ch.id === id);
+      const rowIds = target ? target.rows.map((r) => r.id) : [];
+      return { ...c, characters: c.characters.filter((ch) => ch.id !== id), cells: purgeCellsByRowIds(c.cells, rowIds) };
+    });
+  };
+  const addRow = async (charId) => {
+    const nm = await dlg.prompt("名称", "新行", "新增行");
+    if (!nm) return;
+    setContent((c) => ({ ...c, characters: c.characters.map((ch) => (ch.id === charId ? { ...ch, rows: [...ch.rows, { id: uid(), name: nm }] } : ch)) }));
+  };
+  const renameRow = async (charId, rowId, currentName) => {
+    const nm = await dlg.prompt("名称", currentName, "重命名行");
+    if (!nm) return;
+    setContent((c) => ({ ...c, characters: c.characters.map((ch) => (ch.id !== charId ? ch : { ...ch, rows: ch.rows.map((r) => (r.id === rowId ? { ...r, name: nm } : r)) })) }));
+  };
+  const deleteRow = async (charId, rowId, rname) => {
+    const target = characters.find((ch) => ch.id === charId);
+    if (target && target.rows.length <= 1) { await dlg.alert("角色模块至少要保留一行", "无法删除"); return; }
+    const ok = await dlg.confirm(`删除行「${rname}」？该行已经填写的内容会一并删除。`, "删除行");
+    if (!ok) return;
+    setContent((c) => ({
+      ...c,
+      characters: c.characters.map((ch) => (ch.id !== charId ? ch : { ...ch, rows: ch.rows.filter((r) => r.id !== rowId) })),
+      cells: purgeCellsByRowIds(c.cells, [rowId]),
+    }));
+  };
+
+  /* ---- 图例 ---- */
+  const renameLegendLabel = async (listKey, key, currentLabel) => {
+    const nm = await dlg.prompt("名称", currentLabel, "重命名图例");
+    if (!nm) return;
+    setContent((c) => ({ ...c, [listKey]: c[listKey].map((l) => (l.key === key ? { ...l, label: nm } : l)) }));
+  };
+  const setLegendColor = (listKey, key, color) => setContent((c) => ({ ...c, [listKey]: c[listKey].map((l) => (l.key === key ? { ...l, color } : l)) }));
+  const addLegendEntry = async (listKey) => {
+    const nm = await dlg.prompt("名称", "新标记", "新增图例");
+    if (!nm) return;
+    const color = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+    setContent((c) => ({ ...c, [listKey]: [...c[listKey], { key: uid(), color, label: nm }] }));
+  };
+  const deleteLegendEntry = async (listKey, key) => {
+    const ok = await dlg.confirm("删除这个图例？已经用掉这个颜色的格子/图标不会被自动清除，只是图例里不再显示名字。", "删除图例");
+    if (!ok) return;
+    setContent((c) => ({ ...c, [listKey]: c[listKey].filter((l) => l.key !== key) }));
+  };
+
+  /* ---- 格子 ---- */
+  const getCell = (rowId, colId) => cells[cellKeyOf(rowId, colId)] || { text: "", bg: null, icons: [] };
+  const patchCell = (rowId, colId, patch) => {
+    setContent((c) => {
+      const key = cellKeyOf(rowId, colId);
+      const cur = c.cells[key] || { text: "", bg: null, icons: [] };
+      return { ...c, cells: { ...c.cells, [key]: { ...cur, ...patch } } };
+    });
+  };
+
+  return (
+    <div className="timeline-page">
       <div className="page-topbar">
         <input className="page-name" value={name} onChange={(e) => { setName(e.target.value); onChange((p) => ({ ...p, name: e.target.value })); }} />
-        <button className="manual-save-btn" onClick={handleManualSave}>💾 立即保存</button>
-        <span className="tag">文字区</span>
+        <span className="tag" style={{ background: "#5a8a6f" }}>时间线</span>
       </div>
-      <div className="text-toolbar">
-        <button onClick={() => exec("bold")}><b>B</b></button>
-        <button onClick={() => exec("italic")}><i>I</i></button>
-        <button onClick={() => exec("underline")}><u>U</u></button>
-        <button onClick={() => exec("insertUnorderedList")}>•≡</button>
-        <button onClick={() => exec("insertOrderedList")}>1≡</button>
-        <button onMouseDown={(e) => { e.preventDefault(); exec("formatBlock", "H3"); }}>H</button>
+      <div className="legend-bar">
+        <LegendGroup label="格子背景色" entries={cellColorLegend}
+          onRename={(k, l) => renameLegendLabel("cellColorLegend", k, l)}
+          onColor={(k, c) => setLegendColor("cellColorLegend", k, c)}
+          onAdd={() => addLegendEntry("cellColorLegend")}
+          onDelete={(k) => deleteLegendEntry("cellColorLegend", k)} />
+        <LegendGroup label="图标" entries={iconLegend}
+          onRename={(k, l) => renameLegendLabel("iconLegend", k, l)}
+          onColor={(k, c) => setLegendColor("iconLegend", k, c)}
+          onAdd={() => addLegendEntry("iconLegend")}
+          onDelete={(k) => deleteLegendEntry("iconLegend", k)} />
       </div>
-      <div
-        ref={ref} className="text-editor" contentEditable suppressContentEditableWarning
-        data-placeholder="在这里记录设定内容…支持加粗、列表、标题"
-        onInput={handleInput}
-        onBlur={(e) => {
-          if (typingTimer.current) clearTimeout(typingTimer.current);
-          onChange((p) => ({ ...p, content: { html: readHtml(e.currentTarget) } }), { immediate: true });
-        }}
-      />
+      <div className="timeline-toolbar">
+        <button onClick={addYearAtEnd}>+ 新增年份（末尾）</button>
+        <button onClick={addCharacter}>+ 新增角色</button>
+      </div>
+      <div className="timeline-body">
+        <div className="timeline-scroll">
+          {leafColumns.length === 0 ? (
+            <div style={{ padding: 24, color: "var(--ink-soft)", fontSize: 12.5 }}>先点上面「+ 新增年份」建立时间轴</div>
+          ) : characters.length === 0 ? (
+            <div style={{ padding: 24, color: "var(--ink-soft)", fontSize: 12.5 }}>再点「+ 新增角色」添加第一个角色模块</div>
+          ) : (
+            <table className="timeline-table">
+              <thead>
+                {headerRows.map((row, ri) => (
+                  <tr key={ri} className={"tl-head-row-" + ri}>
+                    {ri === 0 && <th className="tl-corner" colSpan={2} rowSpan={4} />}
+                    {row.map((cell) => (
+                      <th key={cell.id} className="tl-head-cell" colSpan={cell.colSpan} rowSpan={cell.rowSpan}>
+                        <div className="tl-head-actions">
+                          <button title="在左侧插入同级" onClick={() => addSiblingAtLevel(cell.id, cell.level, false)}>◀+</button>
+                          <button title="删除" onClick={() => deleteAxisNode(cell.id, cell.name)}>✕</button>
+                          <button title="在右侧插入同级" onClick={() => addSiblingAtLevel(cell.id, cell.level, true)}>+▶</button>
+                        </div>
+                        <div className="tl-head-name" onClick={() => renameAxisNode(cell.id, cell.name)} title="点击改名">{cell.name}</div>
+                        {cell.level !== "hour" && (
+                          <button className="tl-add-child" onClick={() => addChildAtLevel(cell.id, cell.level)}>+{LEVEL_LABELS[AXIS_NEXT_LEVEL[cell.level]]}</button>
+                        )}
+                      </th>
+                    ))}
+                  </tr>
+                ))}
+              </thead>
+              <tbody>
+                {characters.flatMap((ch) => ch.rows.map((row, ri) => (
+                  <tr key={row.id} className={ri === 0 ? "tl-char-group-start" : ""}>
+                    {ri === 0 && (
+                      <td className="tl-char-cell" rowSpan={ch.rows.length}>
+                        <div className="tl-char-name" onClick={() => renameCharacterFn(ch.id, ch.name)} title="点击改名">{ch.name}</div>
+                        <div className="tl-char-actions">
+                          <button onClick={() => addRow(ch.id)} title="新增行">+行</button>
+                          <button onClick={() => deleteCharacterFn(ch.id, ch.name)} title="删除角色">✕</button>
+                        </div>
+                      </td>
+                    )}
+                    <td className="tl-row-cell">
+                      <div className="tl-row-name" onClick={() => renameRow(ch.id, row.id, row.name)} title="点击改名">{row.name}</div>
+                      <div className="tl-row-actions">
+                        <button onClick={() => deleteRow(ch.id, row.id, row.name)} title="删除此行">✕</button>
+                      </div>
+                    </td>
+                    {leafColumns.map((col) => {
+                      const cell = getCell(row.id, col.id);
+                      const isSelected = selectedCell && selectedCell.rowId === row.id && selectedCell.colId === col.id;
+                      const bgLegend = cellColorLegend.find((l) => l.key === cell.bg);
+                      return (
+                        <td
+                          key={col.id}
+                          className={"tl-data-cell" + (isSelected ? " selected" : "")}
+                          style={{ background: bgLegend ? bgLegend.color + "33" : undefined }}
+                          onClick={() => setSelectedCell({ rowId: row.id, colId: col.id })}
+                        >
+                          <div className="tl-data-text">{cell.text}</div>
+                          {cell.icons.length > 0 && (
+                            <div className="tl-data-icons">
+                              {cell.icons.slice(0, 3).map((ic) => {
+                                const legend = iconLegend.find((l) => l.key === ic.colorKey);
+                                return <span key={ic.id} className="tl-dot" style={{ background: legend?.color || "#999" }} title={legend?.label} />;
+                              })}
+                              {cell.icons.length > 3 && <span className="tl-dot-more">+{cell.icons.length - 3}</span>}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                )))}
+              </tbody>
+            </table>
+          )}
+        </div>
+        {selectedCell && (
+          <CellEditorPanel
+            cell={getCell(selectedCell.rowId, selectedCell.colId)}
+            cellColorLegend={cellColorLegend}
+            iconLegend={iconLegend}
+            onPatch={(patch) => patchCell(selectedCell.rowId, selectedCell.colId, patch)}
+            onClose={() => setSelectedCell(null)}
+          />
+        )}
+      </div>
     </div>
   );
 }

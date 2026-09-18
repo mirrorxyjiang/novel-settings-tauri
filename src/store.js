@@ -62,3 +62,12 @@ export async function readAsset(relativePath) {
 export async function deleteAsset(relativePath) {
   return invoke("delete_asset", { relativePath });
 }
+
+/**
+ * 正文模块导出：把模块内所有文字页面导出为 txt。
+ * files: [{ name: 页面名, content: 纯文本内容 }]，
+ * 后端会先弹出文件夹选择框，每个页面写成一个独立 txt，返回成功导出的文件数（取消返回 0）。
+ */
+export async function exportTextPages(files) {
+  return invoke("export_text_pages", { files });
+}

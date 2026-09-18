@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,7 +51,7 @@ fn resolve_data_dir(app: &AppHandle) -> PathBuf {
             .path()
             .app_data_dir()
             .expect("无法解析应用数据目录")
-            .join("NovelSettingsData"),
+            .join("StoryBoxData"),
     };
     fs::create_dir_all(dir.join("books")).ok();
     fs::create_dir_all(dir.join("books").join(".trash")).ok();
@@ -267,6 +268,68 @@ fn delete_asset(app: AppHandle, relative_path: String) -> Result<(), String> {
     Ok(())
 }
 
+/* ============================================================
+   正文模块导出：把模块内所有文字页面一键导出为 txt 文件
+   用户选择一个目标文件夹后，每个文字页面写成一个独立的 .txt 文件；
+   重名文件自动追加序号，不会覆盖已有文件。
+   ============================================================ */
+
+#[derive(Deserialize)]
+struct ExportFile {
+    name: String,
+    content: String,
+}
+
+/// 把页面名转成合法的文件名：替换 Windows 不允许的字符，空名字兜底
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let t = cleaned.trim();
+    if t.is_empty() {
+        "未命名".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// 弹出文件夹选择框，把每个文字页面写成一个 txt；用户取消选择时返回 Ok(0)
+#[tauri::command]
+async fn export_text_pages(app: AppHandle, files: Vec<ExportFile>) -> Result<usize, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |folder| {
+        let _ = tx.send(folder);
+    });
+    let folder = match rx.await {
+        Ok(Some(path)) => PathBuf::from(path.to_string()),
+        _ => return Ok(0), // 用户取消了文件夹选择
+    };
+
+    let mut used: HashSet<String> = HashSet::new();
+    let mut count = 0usize;
+    for f in files {
+        let base = sanitize_filename(&f.name);
+        let mut candidate = format!("{base}.txt");
+        let mut i = 2;
+        loop {
+            let fresh = used.insert(candidate.clone());
+            if fresh && !folder.join(&candidate).exists() {
+                break;
+            }
+            candidate = format!("{base}({i}).txt");
+            i += 1;
+        }
+        let path = folder.join(&candidate);
+        fs::write(&path, &f.content).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -282,6 +345,7 @@ pub fn run() {
             save_asset,
             read_asset,
             delete_asset,
+            export_text_pages,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");
