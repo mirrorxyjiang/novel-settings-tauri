@@ -65,7 +65,7 @@ fn now_millis() -> u128 {
         .as_millis()
 }
 
-/// 获取当前生效的数据存储目录，供前端在"设定库"首页展示给用户
+/// 获取当前生效的数据存储目录，供前端在"书籍库"首页展示给用户
 #[tauri::command]
 fn get_data_dir(app: AppHandle) -> String {
     resolve_data_dir(&app).to_string_lossy().to_string()

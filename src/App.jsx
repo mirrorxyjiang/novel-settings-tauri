@@ -26,7 +26,7 @@ function useAssetDataUrl(relativePath) {
 }
 
 /* ============================================================
-   Story-Box（故事魔盒）—— 小说设定管理工具 · Tauri 桌面版（本地文件存储）
+   Story-Box（故事魔盒）—— 小说创作工具 · Tauri 桌面版（本地文件存储）
    书籍 -> 模块（地图/人物/大纲/正文/自定义） -> 页面（绘图区/文字区/时间线/变量）
    每本书独立保存为 数据目录/books/{id}.json，方便备份与云盘同步迁移
    ============================================================ */
@@ -527,7 +527,7 @@ export default function App() {
   };
 
   if (bookIndex === null || opening) {
-    return <Shell><div className="loading">{opening ? "正在打开书籍…" : "正在载入设定库…"}</div></Shell>;
+    return <Shell><div className="loading">{opening ? "正在打开书籍…" : "正在载入书籍库…"}</div></Shell>;
   }
 
   if (!currentBook) {
@@ -1011,8 +1011,8 @@ function BookLibrary({ books, dataDir, onChooseDataDir, onOpen, onCreate, onDele
   return (
     <div className="library">
       <div className="library-brand">Story-Box · 故事魔盒</div>
-      <h1>设定库</h1>
-      <div className="sub">选择一本书继续创作，或新建一本书开始整理设定。</div>
+      <h1>书籍库</h1>
+      <div className="sub">选择一本书继续创作，或新建一本书开始创作。</div>
       <div className="storage-row">
         <span>当前存储位置：</span>
         <span className="path" title={dataDir}>{dataDir || "读取中…"}</span>
@@ -1155,7 +1155,7 @@ function Sidebar({
   return (
     <div className="sidebar">
       <div className="sidebar-header">
-        <button className="sidebar-back" onClick={onBack}>← 返回设定库</button>
+        <button className="sidebar-back" onClick={onBack}>← 返回书籍库</button>
         <div className="sidebar-booktitle-row">
           <div className="sidebar-booktitle">{book.name}</div>
           <button
@@ -1421,7 +1421,7 @@ function TextPage({ page, onChange, variables }) {
         </div>
         <div
           ref={ref} className="text-editor" contentEditable suppressContentEditableWarning
-          data-placeholder="在这里记录设定内容…支持加粗、列表、标题"
+          data-placeholder="在这里记录内容…支持加粗、列表、标题"
           onInput={handleInput}
           onBlur={(e) => {
             if (typingTimer.current) clearTimeout(typingTimer.current);
@@ -2439,7 +2439,7 @@ function ElementInspector({ el, onPatch, onDelete }) {
       {(el.type === "icon" || el.type === "image" || hasBorderFill) && (
         <div className="field">
           <label>备注</label>
-          <textarea value={el.note || ""} onChange={(e) => onPatch({ note: e.target.value })} placeholder="点击元素后可在此记录详细设定…" />
+          <textarea value={el.note || ""} onChange={(e) => onPatch({ note: e.target.value })} placeholder="点击元素后可在此记录详细内容…" />
         </div>
       )}
       <button className="delete-el-btn" onClick={onDelete}>删除此元素</button>
