@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Story-Box · 故事魔盒",
+  "productName": "Story-Box",
   "version": "0.1.0",
   "identifier": "com.storybox.app",
   "build": {

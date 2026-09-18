@@ -82,9 +82,9 @@
 ### 安装与开发
 
 ```bash
-git clone https://github.com/mirrorxyjiang/novel-settings-tauri.git
-cd novel-settings-tauri
-npm install
+git clone https://github.com/mirrorxyjiang/story-box.git
+cd story-box
+npm install        # 想严格按锁定版本装，可用 npm ci
 npm run tauri dev
 ```
 
@@ -97,8 +97,42 @@ npm run tauri build
 ```
 
 打包前建议：
-1. 用正式图标替换 `src-tauri/icons/` 下的占位图标（`npx tauri icon 你的图标.png` 可自动生成各平台所需尺寸）
+1. 图标：`src-tauri/icons/` 下的图标由 `npx tauri icon <源图>` 生成（源图放在 `src-tauri/icons-source/`）
 2. 把 `src-tauri/tauri.conf.json` 里的 `identifier` 改成你自己的唯一标识（反转域名风格，当前为 `com.storybox.app`）
+
+### 换一台电脑：装软件 + 搬数据
+
+`npm run tauri build` 结束后，安装包在 **`src-tauri/target/release/bundle/`** 里：
+
+| 平台 | 产物 |
+|---|---|
+| Windows | `msi/*.msi`（公司/组策略部署友好）和 `nsis/*.exe`（双击安装，推荐） |
+| macOS | `dmg/*.dmg`、`macos/*.app` |
+| Linux | `deb/*.deb`、`appimage/*.AppImage` |
+
+**第一步：在新电脑上安装**
+把 `.exe`（或 `.msi`）拷过去双击安装即可。因为没有代码签名证书，Windows SmartScreen 会拦一下：点**更多信息 → 仍要运行**放行；macOS 如果提示"无法打开"，在访达里右键应用选**打开**。应用不会自动更新，出新版本就再跑一次安装包覆盖安装。
+
+**第二步：把设定数据搬过去（两种方式，任选）**
+
+*方式 A：拷文件夹（最简单，推荐先做这个）*
+
+1. 老电脑上打开应用 → 书库首页看「当前存储位置」这一行的路径（默认是在系统应用数据目录里的 `StoryBoxData`）
+2. 把这个**整个 `StoryBoxData` 文件夹**（里面有 `books/` 和每个书的 `xxx-assets/` 图片文件夹）拷进 U 盘 / 网盘
+3. 新电脑装好应用后先把这一份拷到本地任意位置（例如 `D:\StoryBoxData`），打开应用 → 点「更改存储位置」→ 选中它 → 立刻就能看到全部书籍
+4. `books/.trash/` 是回收站，不用拷
+
+*方式 B：指向云盘同步文件夹（长期多台电脑用，推荐）*
+
+1. 把上面的 `StoryBoxData` 文件夹放进 OneDrive / iCloud云盘 / 坚果云的同步目录，例如 `OneDrive\StoryBoxData`
+2. 两台电脑上都打开应用 → 「更改存储位置」→ 都指向**同一个云盘目录**
+3. 之后哪台电脑改了内容，另一台等云盘同步完成后**重启应用**就能看到（应用启动时才读盘，不会热重载）
+
+两种方式的注意事项：
+- **图片是跟着书走的**：每本书的图片单独存在 `books/<书籍id>-assets/` 里，书籍 JSON 只存相对路径。只拷 `*.json` 不拷 `-assets` 文件夹，书能打开但插图会变空白。
+- **单本书就是一个 JSON 文件**，想只搬某一本，单独拷 `books/<id>.json` + 对应的 `<id>-assets/` 也行。
+- **不要两台电脑同时编辑同一本书**，云盘会产生冲突副本；需要时手动挑一份改名覆盖。
+- `config.json`（记录了你选的存储目录）在系统级应用配置目录里，不在数据文件夹内，所以换电脑后一定要手动设一次「更改存储位置」。
 
 ---
 
@@ -123,7 +157,7 @@ npm run tauri build
 ## 项目结构
 
 ```
-novel-settings-tauri/
+story-box/
 ├─ public/                   静态资源（favicon 等），vite 原样拷到构建产物
 ├─ index.html                前端入口 HTML
 ├─ package.json
